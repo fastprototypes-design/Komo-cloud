@@ -10,24 +10,25 @@ from config import settings, logger
 supabase: Optional[Client] = None
 
 async def connect_to_supabase():
-    """Conecta a Supabase con reintentos inteligentes"""
     retry_count = 0
     max_retries = 3
     
     while retry_count < max_retries:
         try:
-            # Creamos el cliente Limpio, solo URL y Key
+            # --- ZONA SEGURA (SIN PROXY) ---
             client = create_client(
                 settings.supabase_url,
                 settings.supabase_key
             )
-            # Prueba de conexión rápida
+            # -------------------------------
+            
+            # Prueba de conexión
             try:
                 client.table("businesses").select("id", count="exact").limit(1).execute()
             except Exception:
                 pass 
 
-            logger.info("✅ Conexión a Supabase establecida correctamente")
+            logger.info("✅ Conexión a Supabase establecida (SIN PROXY)")
             return client
             
         except Exception as e:
@@ -35,13 +36,13 @@ async def connect_to_supabase():
             logger.error(f"⚠️ Intento {retry_count}/{max_retries} fallido: {str(e)}")
             await asyncio.sleep(2)
     
-    logger.error("💥 No se pudo conectar a Supabase después de varios intentos")
+    logger.error("💥 No se pudo conectar a Supabase")
     return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- STARTUP ---
-    logger.info(f"🚀 Iniciando {settings.app_name}")
+    # MARCA DE AGUA PARA VERIFICAR ACTUALIZACIÓN
+    logger.info("--- 🚀 INICIANDO VERSIÓN DEFINITIVA (V3) ---")
     logger.info(f"📁 Entorno: {settings.app_env}")
 
     global supabase
@@ -49,8 +50,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # --- SHUTDOWN ---
-    logger.info(f"👋 Apagando {settings.app_name}")
+    logger.info("👋 Apagando sistema")
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
@@ -62,7 +62,8 @@ async def root():
         "system": settings.app_name,
         "env": settings.app_env,
         "status": status,
-        "supabase": db_status
+        "supabase": db_status,
+        "version_code": "FINAL_NO_PROXY"
     }
 
 @app.get("/health")
