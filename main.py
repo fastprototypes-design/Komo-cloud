@@ -2,9 +2,13 @@ import time
 import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, Response
 from supabase import create_client, Client
 from config import settings, logger
+
+# --- 🔐 CONFIGURACIÓN DEL WEBHOOK ---
+# ESTA ES LA CONTRASEÑA QUE PONDRÁS EN META
+VERIFY_TOKEN = "KOMO_TOKEN_2025" 
 
 # Variable global para el cliente de Supabase
 supabase: Optional[Client] = None
@@ -42,7 +46,7 @@ async def connect_to_supabase():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # MARCA DE AGUA PARA VERIFICAR ACTUALIZACIÓN
-    logger.info("--- 🚀 INICIANDO VERSIÓN DEFINITIVA (V3) ---")
+    logger.info("--- 🚀 INICIANDO VERSIÓN CON WEBHOOK (V4) ---")
     logger.info(f"📁 Entorno: {settings.app_env}")
 
     global supabase
@@ -54,6 +58,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+# --- 🌐 RUTAS ---
+
 @app.get("/")
 async def root():
     status = "Online"
@@ -63,9 +69,42 @@ async def root():
         "env": settings.app_env,
         "status": status,
         "supabase": db_status,
-        "version_code": "FINAL_NO_PROXY"
+        "version_code": "FINAL_CON_WEBHOOK"
     }
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+# --- 📞 AQUÍ ESTÁ LA MAGIA DEL WEBHOOK ---
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    """
+    Meta llama a esto para verificar que el servidor es nuestro.
+    """
+    # Extraer parámetros de la URL
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    # Verificar si coinciden
+    if mode and token:
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            logger.info("✅ Webhook verificado exitosamente por Meta")
+            # Devolver el challenge como entero (es lo que Meta pide)
+            return int(challenge)
+        else:
+            logger.warning("⛔ Intento de verificación fallido: Token incorrecto")
+            raise HTTPException(status_code=403, detail="Forbidden")
+    
+    return {"status": "error", "message": "Faltan parámetros"}
+
+@app.post("/webhook")
+async def receive_message(request: Request):
+    """
+    Aquí llegarán los mensajes de WhatsApp en el futuro.
+    Por ahora solo respondemos 'OK' para que Meta no se queje.
+    """
+    return {"status": "received"}
