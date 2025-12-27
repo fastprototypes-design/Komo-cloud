@@ -1,0 +1,11 @@
+# Ignorar secretos
+.env
+.env.local
+
+# Ignorar archivos basura de Python
+__pycache__/
+*.pyc
+
+# Ignorar carpetas del sistema
+.DS_Store
+.vscode/
