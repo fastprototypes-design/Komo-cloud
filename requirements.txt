@@ -1,6 +1,7 @@
 fastapi
-uvicorn[standard]
-supabase>=2.3.0
-python-dotenv
+uvicorn
 pydantic
 pydantic-settings
+supabase
+python-dotenv
+httpx
