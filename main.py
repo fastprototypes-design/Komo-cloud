@@ -16,7 +16,7 @@ async def connect_to_supabase():
     
     while retry_count < max_retries:
         try:
-            # Creamos el cliente SIN proxy, solo URL y Key
+            # Creamos el cliente Limpio, solo URL y Key
             client = create_client(
                 settings.supabase_url,
                 settings.supabase_key
