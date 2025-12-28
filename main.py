@@ -68,7 +68,7 @@ async def registrar_pedido_db(phone: str, detalle: str, total: float):
         logger.error(f"💥 Error guardando pedido: {e}")
         # Si falla por Foreign Key (IDs mal copiados), avisamos en el log
         if "foreign key constraint" in str(e):
-            return "Error: IDs de negocio/sucursal inválidos."
+            return "Error: IDs de negocio/sucursal inválidos en Render."
         return "Error interno guardando pedido."
 
 # --- 📡 WHATSAPP ---
@@ -83,7 +83,7 @@ async def send_whatsapp_message(to_number: str, text_body: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, headers=headers, json=data)
 
-# --- 🧠 IA (Function Calling) ---
+# --- 🧠 IA (Function Calling MEJORADO) ---
 async def ask_gpt4(user_message: str, user_phone: str):
     global CURRENT_MENU_TEXT
     
@@ -92,12 +92,12 @@ async def ask_gpt4(user_message: str, user_phone: str):
             "type": "function",
             "function": {
                 "name": "registrar_pedido",
-                "description": "Usa esto SOLO cuando el cliente confirme COMPRAR.",
+                "description": "Usa esto SOLO cuando el cliente confirme explícitamente COMPRAR.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "detalle": {"type": "string", "description": "Resumen productos"},
-                        "total": {"type": "number", "description": "Total precio"}
+                        "detalle": {"type": "string", "description": "Resumen productos, ej: Pizza Pepperoni"},
+                        "total": {"type": "number", "description": "Total precio numérico"}
                     },
                     "required": ["detalle", "total"]
                 }
@@ -105,12 +105,18 @@ async def ask_gpt4(user_message: str, user_phone: str):
         }
     ]
 
+    # --- 🧠 CEREBRO NUEVO (Agresivo para vender) ---
     system_prompt = f"""
-    Eres Komo. 
+    Eres Komo, un vendedor de pizzas eficiente y directo.
+    
+    TU MENÚ Y PRECIOS:
     {CURRENT_MENU_TEXT}
-    REGLAS:
-    1. Responde corto.
-    2. Si confirman venta, EJECUTA 'registrar_pedido'.
+    
+    REGLAS CRÍTICAS DE COMPORTAMIENTO:
+    1. MEMORIA ACTIVA: Si el cliente dice "Sí", "Confirmo", "Lo quiero" o "Dale", DEBES asumir que se refiere al producto mencionado en el contexto inmediato. NO preguntes "¿Qué deseas?".
+    2. ACCIÓN: En cuanto detectes una intención de compra confirmada, LLAMA INMEDIATAMENTE a la función 'registrar_pedido'.
+    3. DEDUCCIÓN: Si el mensaje anterior hablaba de "Pepperoni" ($150) y el usuario dice "Sí", tus parámetros son: detalle="Pizza Pepperoni", total=150.
+    4. SÉ BREVE: Confirma la venta en una sola frase.
     """
 
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]
@@ -122,10 +128,14 @@ async def ask_gpt4(user_message: str, user_phone: str):
         msg = response.choices[0].message
         
         if msg.tool_calls:
+            # GPT decidió vender
             tool_call = msg.tool_calls[0]
             args = json.loads(tool_call.function.arguments)
+            
+            # Ejecutar guardado en DB
             resultado_db = await registrar_pedido_db(user_phone, args["detalle"], args["total"])
             
+            # Avisar a GPT que ya se guardó
             messages.append(msg)
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": resultado_db})
             
@@ -137,7 +147,7 @@ async def ask_gpt4(user_message: str, user_phone: str):
         return msg.content
     except Exception as e:
         logger.error(f"Error GPT: {e}")
-        return "Un momento..."
+        return "Un momento, estoy verificando..."
 
 # --- ARRANQUE ---
 @asynccontextmanager
