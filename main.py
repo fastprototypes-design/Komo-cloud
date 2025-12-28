@@ -26,11 +26,9 @@ CURRENT_MENU_TEXT = "Cargando menú..."
 # --- 🛠️ HERRAMIENTA 1: MENÚ ---
 async def get_menu_from_db():
     try:
-        # Filtramos productos activos
         response = supabase.table("products").select("*").eq("is_active", True).execute()
         products = response.data
         if not products: return "Sin productos."
-        
         menu_text = "MENÚ DISPONIBLE:\n"
         for p in products:
             menu_text += f"- {p['name']}: ${p['price']} ({p.get('category','')})\n"
@@ -38,38 +36,34 @@ async def get_menu_from_db():
     except Exception:
         return "Error menú."
 
-# --- 🛠️ HERRAMIENTA 2: GUARDAR PEDIDO (ENTERPRISE) ---
-async def registrar_pedido_db(phone: str, detalle: str, total: float):
+# --- 🛠️ HERRAMIENTA 2: GUARDAR PEDIDO COMPLETO ---
+async def registrar_pedido_db(phone: str, detalle: str, total: float, direccion: str, metodo_pago: str):
     """
-    Inserta el pedido llenando TODOS los campos de la tabla avanzada.
+    Inserta el pedido SOLO cuando tenemos todos los datos.
     """
-    # Generar un número de orden único simple (Timestamp)
+    # Generamos un ID de orden simple
     order_num = f"ORD-{int(time.time())}"
     
     try:
         data = {
-            "business_id": BUSINESS_ID,      # 🔗 Vinculado a tu negocio
-            "branch_id": BRANCH_ID,          # 🔗 Vinculado a tu sucursal
+            "business_id": BUSINESS_ID,
+            "branch_id": BRANCH_ID,
             "customer_phone": phone,
             "order_details": detalle,
             "total_price": total,
             "status": "confirmed",
-            "order_number": order_num,       # 🔢 ID legible #ORD-1765...
-            "order_type": "delivery",        # Valor por defecto
-            "delivery_address": "Por definir en chat" # Placeholder
+            "order_number": order_num,
+            "order_type": "delivery",
+            "delivery_address": direccion,   # 📍 DATO REAL
+            "payment_method": metodo_pago    # 💵 DATO REAL
         }
         
-        # Insertar en la tabla 'orders'
         supabase.table("orders").insert(data).execute()
-        
-        logger.info(f"✅ PEDIDO COMPLETO GUARDADO: {order_num} - {detalle}")
-        return f"Pedido {order_num} registrado correctamente."
+        logger.info(f"✅ VENTA CERRADA: {order_num} | Dir: {direccion} | Pago: {metodo_pago}")
+        return f"Pedido {order_num} registrado exitosamente. Enviaremos a: {direccion}."
     except Exception as e:
         logger.error(f"💥 Error guardando pedido: {e}")
-        # Si falla por Foreign Key (IDs mal copiados), avisamos en el log
-        if "foreign key constraint" in str(e):
-            return "Error: IDs de negocio/sucursal inválidos en Render."
-        return "Error interno guardando pedido."
+        return "Error interno al guardar pedido."
 
 # --- 📡 WHATSAPP ---
 async def send_whatsapp_message(to_number: str, text_body: str):
@@ -83,40 +77,53 @@ async def send_whatsapp_message(to_number: str, text_body: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, headers=headers, json=data)
 
-# --- 🧠 IA (Function Calling MEJORADO) ---
+# --- 🧠 CEREBRO GPT-4 (VENDEDOR AMABLE Y ESTRICTO CON DATOS) ---
 async def ask_gpt4(user_message: str, user_phone: str):
     global CURRENT_MENU_TEXT
     
+    # 🔧 HERRAMIENTA OBLIGATORIA
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "registrar_pedido",
-                "description": "Usa esto SOLO cuando el cliente confirme explícitamente COMPRAR.",
+                "description": "Usa esto SOLO cuando tengas PRODUCTO, DIRECCIÓN y FORMA DE PAGO.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "detalle": {"type": "string", "description": "Resumen productos, ej: Pizza Pepperoni"},
-                        "total": {"type": "number", "description": "Total precio numérico"}
+                        "detalle": {"type": "string", "description": "Resumen del pedido (Ej: 1 Pizza Pepperoni)"},
+                        "total": {"type": "number", "description": "Precio total numérico"},
+                        "direccion": {"type": "string", "description": "Dirección de entrega completa"},
+                        "metodo_pago": {"type": "string", "description": "Efectivo o Tarjeta"}
                     },
-                    "required": ["detalle", "total"]
+                    "required": ["detalle", "total", "direccion", "metodo_pago"]
                 }
             }
         }
     ]
 
-    # --- 🧠 CEREBRO NUEVO (Agresivo para vender) ---
+    # 🎭 PERSONALIDAD Y REGLAS
     system_prompt = f"""
-    Eres Komo, un vendedor de pizzas eficiente y directo.
+    Eres Komo, un vendedor de pizzas experto, muy amable y con gran actitud. 🍕✨
     
-    TU MENÚ Y PRECIOS:
+    TU MENÚ:
     {CURRENT_MENU_TEXT}
     
-    REGLAS CRÍTICAS DE COMPORTAMIENTO:
-    1. MEMORIA ACTIVA: Si el cliente dice "Sí", "Confirmo", "Lo quiero" o "Dale", DEBES asumir que se refiere al producto mencionado en el contexto inmediato. NO preguntes "¿Qué deseas?".
-    2. ACCIÓN: En cuanto detectes una intención de compra confirmada, LLAMA INMEDIATAMENTE a la función 'registrar_pedido'.
-    3. DEDUCCIÓN: Si el mensaje anterior hablaba de "Pepperoni" ($150) y el usuario dice "Sí", tus parámetros son: detalle="Pizza Pepperoni", total=150.
-    4. SÉ BREVE: Confirma la venta en una sola frase.
+    📜 REGLAS DE ORO PARA LA VENTA:
+    
+    1. **NO GUARDES A MEDIAS:**
+       Si el cliente dice "Quiero la pizza", **NO** uses la herramienta todavía.
+       Responde con entusiasmo: "¡Excelente elección! 🍕 El total es $150. Para enviártela, ¿me ayudas con tu dirección y forma de pago (Efectivo/Tarjeta)?"
+       
+    2. **RECOPILA TODO:**
+       Solo llama a 'registrar_pedido' cuando el cliente te haya dado explícitamente:
+       - Qué quiere.
+       - Su dirección.
+       - Cómo va a pagar.
+       
+    3. **SEDUCE Y AGRADECE:**
+       - Usa emojis (🍕, 🛵, 🎉).
+       - Cuando la herramienta confirme el guardado, responde al cliente confirmando que la comida va en camino y agradece la compra.
     """
 
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]
@@ -127,15 +134,15 @@ async def ask_gpt4(user_message: str, user_phone: str):
         )
         msg = response.choices[0].message
         
+        # Si GPT decide llamar a la herramienta (tiene todos los datos)
         if msg.tool_calls:
-            # GPT decidió vender
             tool_call = msg.tool_calls[0]
             args = json.loads(tool_call.function.arguments)
             
-            # Ejecutar guardado en DB
-            resultado_db = await registrar_pedido_db(user_phone, args["detalle"], args["total"])
+            # Guardamos en Supabase
+            resultado_db = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args["metodo_pago"])
             
-            # Avisar a GPT que ya se guardó
+            # Le damos el resultado a GPT para que se despida bonito
             messages.append(msg)
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": resultado_db})
             
@@ -147,7 +154,7 @@ async def ask_gpt4(user_message: str, user_phone: str):
         return msg.content
     except Exception as e:
         logger.error(f"Error GPT: {e}")
-        return "Un momento, estoy verificando..."
+        return "Dame un segundo, estoy procesando tu solicitud..."
 
 # --- ARRANQUE ---
 @asynccontextmanager
@@ -157,17 +164,16 @@ async def lifespan(app: FastAPI):
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     CURRENT_MENU_TEXT = await get_menu_from_db()
     
-    # Check rápido de IDs
     if not BUSINESS_ID or not BRANCH_ID:
-        logger.warning("⚠️ OJO: Faltan BUSINESS_ID o BRANCH_ID en Render")
+        logger.warning("⚠️ FALTAN IDs EN RENDER")
         
-    logger.info("🚀 KOMO ENTERPRISE ACTIVO")
+    logger.info("🚀 KOMO V2: MODO AMABLE Y COMPLETO ACTIVO")
     yield
 
 app = FastAPI(title="Komo Enterprise", lifespan=lifespan)
 
 @app.get("/")
-def home(): return {"status": "Enterprise System Online 🏢"}
+def home(): return {"status": "Online 🍕"}
 
 @app.get("/health")
 def health(): return {"status": "ok"}
