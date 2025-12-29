@@ -6,3 +6,7 @@ supabase
 python-dotenv
 httpx
 openai
+streamlit
+pandas
+pydeck
+toml

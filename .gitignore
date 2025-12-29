@@ -1,11 +1,17 @@
-# Ignorar secretos
+# --- Secretos y Claves (NUNCA SUBIR) ---
 .env
 .env.local
+.streamlit/secrets.toml
 
-# Ignorar archivos basura de Python
+# --- Archivos basura de Python ---
 __pycache__/
 *.pyc
 
-# Ignorar carpetas del sistema
+# --- Entornos Virtuales (opcional pero recomendado) ---
+.venv/
+env/
+venv/
+
+# --- Carpetas del sistema y editor ---
 .DS_Store
 .vscode/
