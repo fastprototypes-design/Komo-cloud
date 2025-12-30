@@ -17,6 +17,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 MANAGER_PHONE = os.environ.get("MANAGER_PHONE")
 
+# Validate required environment variables
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
 if not OPENAI_API_KEY:
@@ -48,8 +49,6 @@ async def download_whatsapp_media(media_id: str):
     except Exception as e:
         print(f"Error downloading media: {e}")
         return None
-        print(f"Error downloading media: {e}")
-        return None
 
 async def transcribe_audio(audio_bytes):
     try:
@@ -72,7 +71,9 @@ def get_menu_text():
         for item in items:
             menu_str += f"- {item['name']}: ${item['price']} ({item.get('description','')})\n"
         return menu_str
-    except: return "Consultar disponibilidad."
+    except Exception as e:
+        print(f"Error fetching menu: {e}")
+        return "Consultar disponibilidad."
 
 async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
     order_num = f"ORD-{int(time.time())}"
@@ -90,8 +91,6 @@ async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
             
         return f"🎉 ¡Pedido {order_num} confirmado!\n\n🍕 {detalle}\n💰 Total: ${total}\n📍 Dirección: {direccion}\n\n¡En Komo Fast Food ya estamos preparando tu orden! 🔥"
     except Exception as e:
-        print(f"Error registering order: {e}")
-        return "Perdón, tuve un error al guardar tu pedido. ¿Podemos intentar de nuevo?"
         print(f"Error registering order: {e}")
         return "Perdón, tuve un error al guardar tu pedido. ¿Podemos intentar de nuevo?"
 
