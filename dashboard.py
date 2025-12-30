@@ -7,194 +7,148 @@ import toml
 import os
 import time
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Komo Command Center", page_icon="🍕", layout="wide")
+st.set_page_config(page_title="Komo Ops Center", page_icon="⚡", layout="wide")
 
-# --- 🔐 TU SISTEMA DE CONEXIÓN ---
+# --- 🔐 CONEXIÓN ---
 def load_credentials():
     try:
         return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
-    except FileNotFoundError:
+    except:
         try:
             if os.path.exists(".streamlit/secrets.toml"):
                 with open(".streamlit/secrets.toml", "r") as f:
                     data = toml.load(f)
                     return data["SUPABASE_URL"], data["SUPABASE_KEY"]
-        except Exception: pass
+        except: pass
     return None, None
 
 URL, KEY = load_credentials()
-if not URL or not KEY:
-    st.error("❌ Sin credenciales. Revisa secrets.toml")
-    st.stop()
+if not URL: st.stop()
+supabase = create_client(URL, KEY)
 
-@st.cache_resource
-def init_connection():
-    return create_client(URL, KEY)
+# --- 🧠 FUNCIONES AVANZADAS ---
 
-supabase = init_connection()
-
-# --- FUNCIONES DE DATOS ---
-def get_live_orders():
-    # Traemos órdenes activas
-    response = supabase.table("orders").select("*").in_("status", ["confirmed", "cooking", "delivering"]).order("created_at", desc=True).execute()
+def get_live_data():
+    # Trae órdenes para cálculo de tiempos
+    response = supabase.table("orders").select("*").order("created_at", desc=True).limit(100).execute()
     df = pd.DataFrame(response.data)
-    if not df.empty:
-        # Aseguramos que el precio sea numérico para sumar
-        df['total_price'] = pd.to_numeric(df['total_price'], errors='coerce').fillna(0)
+    
+    # Convertir fechas
+    cols_time = ['created_at', 'cooking_at', 'delivering_at', 'completed_at']
+    for col in cols_time:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce') # Importante: coerce para evitar errores
+            
     return df
 
-def get_completed_stats():
-    # Para el resumen histórico (opcional, si quieres ver lo vendido hoy incluye lo cerrado)
-    # Por ahora sumaremos solo lo activo + lo completado hoy si quisieras.
-    # Usaremos el dataframe de live orders para el KPI rápido.
-    pass 
+def get_complaints():
+    # Trae las quejas abiertas
+    try:
+        response = supabase.table("complaints").select("*").eq("status", "open").execute()
+        return response.data
+    except: return []
 
-def get_chat_preview():
-    response = supabase.table("chat_history").select("*").order("created_at", desc=True).limit(20).execute()
-    return response.data
+def update_status_timestamp(order_id, new_status):
+    # CRONÓMETRO: Guardamos la hora exacta del clic
+    now = datetime.now().isoformat()
+    update_data = {"status": new_status}
+    
+    if new_status == "cooking": update_data["cooking_at"] = now
+    if new_status == "delivering": update_data["delivering_at"] = now
+    if new_status == "completed": update_data["completed_at"] = now
+    
+    supabase.table("orders").update(update_data).eq("id", order_id).execute()
+    st.toast(f"⏱️ Estado actualizado a: {new_status}")
+    time.sleep(0.5)
+    st.rerun()
 
-def update_order_status(order_id, new_status):
-    supabase.table("orders").update({"status": new_status}).eq("id", order_id).execute()
-    st.toast(f"Orden actualizada a: {new_status}")
+def resolve_complaint(complaint_id):
+    supabase.table("complaints").update({"status": "resolved"}).eq("id", complaint_id).execute()
+    st.toast("Queja resuelta ✅")
     time.sleep(0.5)
     st.rerun()
 
 # --- INTERFAZ ---
-st.title("🛸 Komo: Operación Central")
+st.title("⚡ Komo: Performance Dashboard")
 
-# Layout: 60% Mapa, 40% Panel de Control (un poco más espacio para el chat)
-col_mapa, col_ops = st.columns([3, 2])
-
-df_orders = get_live_orders()
-
-# --- COLUMNA IZQUIERDA: MAPA ---
-with col_mapa:
-    st.subheader("📍 Radar de Entregas")
+# 1. KPIs DE TIEMPO (EL "AVERAGE HANDLE TIME")
+df = get_live_data()
+if not df.empty and 'cooking_at' in df.columns and 'completed_at' in df.columns:
+    st.subheader("⏱️ Tiempos Promedio (AHT)")
     
-    if not df_orders.empty:
-        # KPI RÁPIDO MAPA
-        active_count = len(df_orders)
-        st.caption(f"Monitorizando {active_count} pedidos activos en el mapa.")
-
-        map_data = df_orders.dropna(subset=['delivery_latitude', 'delivery_longitude'])
-        map_data['delivery_latitude'] = pd.to_numeric(map_data['delivery_latitude'])
-        map_data['delivery_longitude'] = pd.to_numeric(map_data['delivery_longitude'])
-
-        if not map_data.empty:
-            layer = pdk.Layer(
-                "ScatterplotLayer",
-                map_data,
-                get_position='[delivery_longitude, delivery_latitude]',
-                get_color='[200, 30, 0, 200]',
-                get_radius=150,
-                pickable=True,
-                auto_highlight=True,
-            )
-            view_state = pdk.ViewState(
-                latitude=map_data['delivery_latitude'].iloc[0],
-                longitude=map_data['delivery_longitude'].iloc[0],
-                zoom=13,
-                pitch=45
-            )
-            r = pdk.Deck(
-                layers=[layer],
-                initial_view_state=view_state,
-                tooltip={"text": "Orden: {order_number}\nStatus: {status}"}
-            )
-            st.pydeck_chart(r)
-        else:
-            st.info("Pedidos activos sin GPS compartido.")
+    # Cálculo Prep Time (Cocina -> Entrega)
+    # (Filtramos solo las que tienen ambos datos)
+    df_prep = df.dropna(subset=['cooking_at', 'delivering_at']).copy()
+    if not df_prep.empty:
+        df_prep['mins_prep'] = (df_prep['delivering_at'] - df_prep['cooking_at']).dt.total_seconds() / 60
+        avg_prep = df_prep['mins_prep'].mean()
     else:
-        st.write("😴 Sin actividad en el radar.")
-        st.pydeck_chart(pdk.Deck(initial_view_state=pdk.ViewState(latitude=25.68, longitude=-100.31, zoom=12)))
+        avg_prep = 0
 
-# --- COLUMNA DERECHA: SALA DE CONTROL ---
-with col_ops:
-    # --- SECCIÓN DE RESUMEN (KPIs) ---
-    st.subheader("📊 Métricas en Vivo")
-    
-    if not df_orders.empty:
-        total_ventas = df_orders['total_price'].sum()
-        conteo_status = df_orders['status'].value_counts()
-        
-        # 1. Tarjetas de Totales
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("💰 Por Cobrar", f"${total_ventas:,.0f}")
-        kpi2.metric("📦 Pedidos", len(df_orders))
-        kpi3.metric("🛵 En Ruta", conteo_status.get('delivering', 0))
-        
-        # 2. Resumen de Acciones (Gráfico de Barras simple)
-        st.markdown("**Estado del Flujo:**")
-        st.bar_chart(conteo_status, color="#FF4B4B", height=150)
-        
+    # Cálculo Delivery Time (Entrega -> Completado)
+    df_del = df.dropna(subset=['delivering_at', 'completed_at']).copy()
+    if not df_del.empty:
+        df_del['mins_del'] = (df_del['completed_at'] - df_del['delivering_at']).dt.total_seconds() / 60
+        avg_del = df_del['mins_del'].mean()
     else:
-        st.metric("Esperando Ventas", "$0")
-
+        avg_del = 0
+        
+    k1, k2, k3 = st.columns(3)
+    k1.metric("🔥 Tiempo Cocina", f"{avg_prep:.1f} min", delta="-2 min" if avg_prep > 15 else "Ok")
+    k2.metric("🛵 Tiempo Entrega", f"{avg_del:.1f} min", delta="-5 min" if avg_del > 30 else "Ok")
+    k3.metric("📦 Total Órdenes", len(df))
     st.divider()
 
-    # --- PESTAÑAS OPERATIVAS ---
-    tab_pedidos, tab_chat = st.tabs(["👨‍🍳 Cocina & Despacho", "💬 Live Chat"])
+# 2. OPERACIÓN DIVIDIDA
+col_ops, col_crm = st.columns([2, 1])
+
+# --- COLUMNA IZQUIERDA: GESTIÓN DE PEDIDOS ---
+with col_ops:
+    st.subheader("👨‍🍳 Flujo de Pedidos")
+    # Filtramos solo activos
+    active_orders = df[df['status'].isin(['confirmed', 'cooking', 'delivering'])]
     
-    with tab_pedidos:
-        if not df_orders.empty:
-            for index, row in df_orders.iterrows():
-                # Color del borde según estado
-                emoji_status = "🔥"
-                if row['status'] == 'cooking': emoji_status = "👨‍🍳"
-                if row['status'] == 'delivering': emoji_status = "🛵"
-
-                with st.expander(f"{emoji_status} #{row.get('order_number','?')} | ${row['total_price']}", expanded=True):
-                    st.write(f"**Detalle:** {row['order_details']}")
-                    st.caption(f"📍 {row['delivery_address']}")
-                    
-                    # Botones de Acción
-                    c1, c2, c3 = st.columns(3)
-                    
-                    # Lógica de Botones (Solo muestra el botón siguiente lógico)
-                    if row['status'] == 'confirmed':
-                        if c1.button("Cocinar", key=f"btn_c_{row['id']}"):
-                            update_order_status(row['id'], "cooking")
-                    elif row['status'] == 'cooking':
-                        if c2.button("Enviar", key=f"btn_s_{row['id']}"):
-                            update_order_status(row['id'], "delivering")
-                    elif row['status'] == 'delivering':
-                        if c3.button("Entregado", key=f"btn_d_{row['id']}"):
-                            update_order_status(row['id'], "completed")
-        else:
-            st.info("Bandeja de entrada limpia. 🧹")
-
-    with tab_chat:
-        chats = get_chat_preview()
-        if chats:
-            for chat in chats:
-                is_bot = chat['role'] == 'assistant'
-                emoji = "🤖" if is_bot else "👤"
+    if not active_orders.empty:
+        for index, row in active_orders.iterrows():
+            color = "blue"
+            if row['status'] == 'cooking': color = "orange"
+            if row['status'] == 'delivering': color = "green"
+            
+            with st.expander(f":{color}[{row['status'].upper()}] - {row.get('customer_phone','Cte')[-4:]}", expanded=True):
+                c1, c2 = st.columns([3,1])
+                c1.write(f"**Pedido:** {row.get('order_details','')}")
+                c1.caption(f"📍 {row.get('delivery_address','')}")
                 
-                # --- CORRECCIÓN DE COLORES ---
-                # Usamos colores oscuros con texto blanco explícito
-                bg_color = "#262730" if is_bot else "#1E4620" # Gris oscuro vs Verde oscuro
-                align = "margin-right: 50px;" if not is_bot else "margin-left: 50px;"
-                
-                st.markdown(
-                    f"""
-                    <div style='
-                        background-color: {bg_color};
-                        color: white;
-                        padding: 10px;
-                        border-radius: 10px;
-                        margin-bottom: 8px;
-                        {align}
-                    '>
-                        <small style='opacity: 0.7;'>{emoji} {chat.get('phone_number','User')[-4:]}:</small><br>
-                        {chat['content']}
-                    </div>
-                    """, 
-                    unsafe_allow_html=True
-                )
-        else:
-            st.write("Sin historial reciente.")
+                # Botonera Lógica con Cronómetro
+                if row['status'] == 'confirmed':
+                    if c2.button("🔥 Cocinar", key=f"c_{row['id']}"): update_status_timestamp(row['id'], "cooking")
+                elif row['status'] == 'cooking':
+                    if c2.button("🛵 Enviar", key=f"d_{row['id']}"): update_status_timestamp(row['id'], "delivering")
+                elif row['status'] == 'delivering':
+                    if c2.button("✅ Fin", key=f"f_{row['id']}"): update_status_timestamp(row['id'], "completed")
+    else:
+        st.info("Cocina limpia ✨")
 
-# Botón de refresco manual
-if st.sidebar.button("🔄 REFRESCAR", type="primary"):
-    st.rerun()
+# --- COLUMNA DERECHA: QUEJAS Y ATENCIÓN ---
+with col_crm:
+    st.subheader("🚨 Quejas / Soporte")
+    
+    complaints = get_complaints()
+    if complaints:
+        for t in complaints:
+            with st.container(border=True):
+                st.error(f"Ticket #{str(t['id'])[:4]}")
+                st.write(f"**Cliente:** {t['customer_phone']}")
+                st.write(f"**Problema:** {t['issue_description']}")
+                
+                # MOSTRAR EVIDENCIA SI HAY
+                if t.get('image_url'):
+                    st.image(t['image_url'], caption="Evidencia enviada por WhatsApp", use_column_width=True)
+                
+                if st.button("Resolver Ticket", key=f"res_{t['id']}"):
+                    resolve_complaint(t['id'])
+    else:
+        st.success("0 Quejas activas. ¡Excelente servicio! 🌟")
+
+# Botón refresh
+if st.sidebar.button("🔄 Refrescar Tablero"): st.rerun()
