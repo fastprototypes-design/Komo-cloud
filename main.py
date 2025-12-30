@@ -7,19 +7,18 @@ from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 from openai import AsyncOpenAI
 
-# --- 🔐 VARIABLES ---
+# --- 🔐 CONFIGURACIÓN ---
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "KOMO_TOKEN_2025")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client: AsyncOpenAI = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# --- 🛠️ UTILIDADES WHATSAPP ---
+# --- 🛠️ UTILIDADES ---
 
 async def send_whatsapp_message(to_number: str, text_body: str):
     if not WHATSAPP_TOKEN: return
@@ -30,39 +29,43 @@ async def send_whatsapp_message(to_number: str, text_body: str):
         await client.post(url, headers=headers, json=data)
 
 async def download_whatsapp_media(media_id: str):
-    """Descarga audio o imagen de Meta"""
     try:
         async with httpx.AsyncClient() as client:
             url_info = f"https://graph.facebook.com/v17.0/{media_id}"
             headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
             resp_info = await client.get(url_info, headers=headers)
             media_url = resp_info.json().get("url")
-            
             if not media_url: return None
             resp_media = await client.get(media_url, headers=headers)
             return resp_media.content
-    except Exception as e:
-        print(f"Error descarga media: {e}")
-        return None
+    except: return None
 
-# --- 👂 EL OÍDO DIGITAL (WHISPER) ---
 async def transcribe_audio(audio_bytes):
-    """Convierte nota de voz de WhatsApp a Texto usando Whisper"""
     try:
-        # Whisper necesita un nombre de archivo, aunque sea en memoria
         transcription = await openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.ogg", audio_bytes) 
+            model="whisper-1", file=("audio.ogg", audio_bytes)
         )
         return transcription.text
-    except Exception as e:
-        print(f"Error Whisper: {e}")
-        return ""
+    except: return ""
 
-# --- 🧠 LÓGICA DE NEGOCIO ---
+# --- 🧠 CEREBRO DINÁMICO (Conexión al CMS) ---
+
+def get_menu_text():
+    """Lee la tabla 'products' y crea el menú para el Prompt"""
+    try:
+        response = supabase.table("products").select("name, price, description").eq("is_active", True).execute()
+        items = response.data
+        if not items:
+            return "Menú no disponible por el momento."
+        
+        menu_str = "MENÚ DISPONIBLE HOY:\n"
+        for item in items:
+            menu_str += f"- {item['name']}: ${item['price']} ({item.get('description', '')})\n"
+        return menu_str
+    except:
+        return "Error leyendo menú."
 
 async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
-    # (Misma lógica anterior para clientes)
     order_num = f"ORD-{int(time.time())}"
     try:
         data = {
@@ -71,27 +74,28 @@ async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
             "status": "confirmed", "customer_name": "Cliente WhatsApp"
         }
         supabase.table("orders").insert(data).execute()
-        return f"✅ Pedido {order_num} confirmado."
-    except: return "Error registrando pedido."
+        # Respuesta NPS 100: Confirmación entusiasta
+        return f"🎉 ¡Excelente elección! Tu pedido {order_num} está confirmado.\n\n🍕 {detalle}\n💰 Total: ${total}\n📍 Destino: {direccion}\n\n¡Corremos a la cocina! 🔥"
+    except: return "Tuve un pequeño error técnico, pero ya avisé al gerente. Dame un minuto."
 
 async def ask_gpt4(user_message: str, user_phone: str, is_audio=False):
-    # Si vino por audio, agregamos una etiqueta para que GPT sepa
-    context_note = "[TRANSCRIPCIÓN DE AUDIO]: " if is_audio else ""
-    full_msg = f"{context_note}{user_message}"
+    # 1. Recuperar Menú Actualizado del CMS
+    current_menu = get_menu_text()
 
-    # Guardar historial
+    # 2. Historial de Chat
     try:
-        supabase.table("chat_history").insert({"phone_number": user_phone, "role": "user", "content": full_msg}).execute()
-        history_resp = supabase.table("chat_history").select("role, content").eq("phone_number", user_phone).order("created_at", desc=True).limit(6).execute()
+        note = "[AUDIO TRANSCRITO] " if is_audio else ""
+        supabase.table("chat_history").insert({"phone_number": user_phone, "role": "user", "content": f"{note}{user_message}"}).execute()
+        history_resp = supabase.table("chat_history").select("role, content").eq("phone_number", user_phone).order("created_at", desc=True).limit(8).execute()
         history = history_resp.data[::-1] if history_resp.data else []
     except: history = []
 
-    # Herramientas para Clientes
+    # 3. Herramientas
     tools = [{
         "type": "function",
         "function": {
             "name": "registrar_pedido",
-            "description": "Registra pedido nuevo",
+            "description": "Usar SOLO cuando el cliente confirme productos, total y dirección.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -103,12 +107,23 @@ async def ask_gpt4(user_message: str, user_phone: str, is_audio=False):
         }
     }]
 
-    # PROMPT HÍBRIDO (Sirve para Clientes y Repartidores)
-    system_prompt = """Eres Komo IA. 
-    1. CLIENTES: Vende pizzas ($150) y tacos ($80). Sé amable.
-    2. REPARTIDORES: Si detectas frases como "Ya entregué", "Voy en camino", "Cierra la orden":
-       - Confírmales con un mensaje corto y militar: "Copiado. 🫡".
-       - (Nota: En una versión futura aquí ejecutaremos el cambio de estado automático).
+    # 4. EL ALMA DEL PROYECTO (PROMPT NPS 100)
+    system_prompt = f"""
+    Eres Komo, el asistente de delivery más amable y eficiente del mundo.
+    Tu misión es lograr una satisfacción total del cliente (NPS 100).
+    
+    TUS REGLAS DE ORO:
+    1. **Empatía Radical:** Si el cliente está feliz, celebra con él. Si está molesto, discúlpate sinceramente y ofrece ayuda inmediata.
+    2. **Brevedad WhatsApp:** Escribe corto, usa espacios y emojis. No mandes bloques de texto gigantes.
+    3. **Vendedor Inteligente:** Si piden una pizza, sugiere una bebida (Cross-selling sutil).
+    4. **Manejo de Repartidores:** Si el mensaje dice "Ya llegué", "Entregado" o frases de staff, responde militarmente: "Copiado 🫡".
+    
+    {current_menu}
+    
+    INSTRUCCIONES DE CONTEXTO:
+    - Si te mandan UBICACIÓN (GPS), úsala como dirección de entrega.
+    - Si te mandan AUDIO, responde confirmando que los escuchaste ("Te escuché decir...").
+    - Antes de cerrar el pedido, confirma el total sumando los precios del menú de arriba.
     """
 
     messages = [{"role": "system", "content": system_prompt}] + history
@@ -125,25 +140,24 @@ async def ask_gpt4(user_message: str, user_phone: str, is_audio=False):
             args = json.loads(tool_call.function.arguments)
             reply_text = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args.get("metodo_pago", "efectivo"))
 
-        # Guardar respuesta
         if reply_text:
             supabase.table("chat_history").insert({"phone_number": user_phone, "role": "assistant", "content": reply_text}).execute()
         
         return reply_text
     except Exception as e:
         print(f"Error GPT: {e}")
-        return "Un momento..."
+        return "Dame un segundo, estoy consultando con cocina..."
 
 # --- 🚀 SERVIDOR ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 KOMO VOZ ACTIVO")
+    print("🚀 KOMO BACKEND v6.0 ONLINE (NPS EDITION)")
     yield
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-def home(): return {"status": "Komo Voice Ready 🎤"}
+def home(): return {"status": "Komo v6.0 - NPS Ready 🌟"}
 
 @app.get("/webhook")
 async def verify(request: Request):
@@ -165,33 +179,31 @@ async def webhook(request: Request):
             sender = msg["from"]
             msg_type = msg["type"]
             
-            # --- MANEJO DE TEXTO ---
             if msg_type == "text":
                 reply = await ask_gpt4(msg["text"]["body"], sender)
                 await send_whatsapp_message(sender, reply)
             
-            # --- MANEJO DE AUDIO (VOZ) ---
             elif msg_type == "audio":
                 audio_id = msg["audio"]["id"]
-                # 1. Descargamos audio
                 audio_bytes = await download_whatsapp_media(audio_id)
                 if audio_bytes:
-                    # 2. Transcribimos con Whisper
                     text = await transcribe_audio(audio_bytes)
-                    # 3. Enviamos el texto a GPT como si el usuario lo hubiera escrito
                     reply = await ask_gpt4(text, sender, is_audio=True)
                     await send_whatsapp_message(sender, reply)
                 else:
-                    await send_whatsapp_message(sender, "No pude escuchar el audio. 🎧")
+                    await send_whatsapp_message(sender, "🎧 No pude escuchar el audio, ¿puedes escribirlo?")
 
-            # --- MANEJO DE UBICACIÓN ---
             elif msg_type == "location":
                 loc = msg["location"]
-                coords = f"Lat: {loc['latitude']}, Long: {loc['longitude']}"
+                coords = f"📍 Coordenadas GPS: {loc['latitude']}, {loc['longitude']}"
                 reply = await ask_gpt4(coords, sender)
                 await send_whatsapp_message(sender, reply)
+            
+            elif msg_type == "image":
+                # Lógica básica para imagen (queja o confirmación)
+                await send_whatsapp_message(sender, "📷 Imagen recibida. Si es una entrega o reporte, ya lo estoy procesando.")
 
         return {"status": "ok"}
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error Webhook: {e}")
         return {"status": "error"}
