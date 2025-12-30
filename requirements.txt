@@ -12,8 +12,8 @@ folium
 streamlit-folium
 watchdog
 tomli
+streamlit-autorefresh
 
 # --- CEREBRO (Versiones Modernas Compatibles) ---
-# Usamos >= para permitir que se instalen las versiones que arreglan el bug de 'proxy'
 supabase>=2.6.0
 openai>=1.55.0
