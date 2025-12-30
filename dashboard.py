@@ -5,121 +5,161 @@ import pydeck as pdk
 from datetime import datetime
 import toml
 import os
+import time
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="Komo Manager", page_icon="🍕", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="Komo Command Center", page_icon="🍕", layout="wide")
 
-# --- 🔐 FUNCIÓN DE CONEXIÓN ROBUSTA (Plan A + Plan B) ---
+# --- 🔐 TU SISTEMA DE CONEXIÓN ROBUSTO ---
 def load_credentials():
-    # INTENTO 1: La forma oficial de Streamlit (Para la Nube/Render)
     try:
         return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
     except FileNotFoundError:
-        pass # Si falla, vamos al Plan B
-        
-    # INTENTO 2: Lectura Manual del archivo (Para tu Windows Local)
-    # Buscamos el archivo donde el "Detective" dijo que estaba
-    try:
-        if os.path.exists(".streamlit/secrets.toml"):
-            with open(".streamlit/secrets.toml", "r") as f:
-                data = toml.load(f)
-                return data["SUPABASE_URL"], data["SUPABASE_KEY"]
-    except Exception as e:
-        st.error(f"Error leyendo manual: {e}")
-    
+        try:
+            if os.path.exists(".streamlit/secrets.toml"):
+                with open(".streamlit/secrets.toml", "r") as f:
+                    data = toml.load(f)
+                    return data["SUPABASE_URL"], data["SUPABASE_KEY"]
+        except Exception: pass
     return None, None
 
-# Cargamos las claves
 URL, KEY = load_credentials()
-
-# Si después de los dos intentos no hay claves, detenemos todo.
 if not URL or not KEY:
-    st.error("❌ ERROR FATAL: No se pudieron leer las credenciales.")
-    st.info("Verifica que el archivo .streamlit/secrets.toml tenga SUPABASE_URL y SUPABASE_KEY")
+    st.error("❌ Sin credenciales. Revisa secrets.toml")
     st.stop()
 
-# --- CONEXIÓN A SUPABASE ---
 @st.cache_resource
 def init_connection():
     return create_client(URL, KEY)
 
-try:
-    supabase = init_connection()
-except Exception as e:
-    st.error(f"Conexión fallida: {e}")
-    st.stop()
+supabase = init_connection()
 
-# --- TÍTULO ---
-st.title("🍕 Komo Enterprise - Torre de Control")
-st.markdown("---")
+# --- FUNCIONES DE DATOS ---
+def get_live_orders():
+    # Traemos órdenes que NO estén completadas o canceladas
+    response = supabase.table("orders").select("*").in_("status", ["confirmed", "cooking", "delivering"]).order("created_at", desc=True).execute()
+    return pd.DataFrame(response.data)
 
-# --- TRAER DATOS ---
-def get_data():
-    try:
-        response = supabase.table("orders").select("*").order("created_at", desc=True).execute()
-        df = pd.DataFrame(response.data)
-        if not df.empty:
-            df['created_at'] = pd.to_datetime(df['created_at'])
-            df['total_price'] = pd.to_numeric(df['total_price'], errors='coerce').fillna(0)
-            df['delivery_latitude'] = pd.to_numeric(df['delivery_latitude'], errors='coerce')
-            df['delivery_longitude'] = pd.to_numeric(df['delivery_longitude'], errors='coerce')
-        return df
-    except Exception as e:
-        st.error(f"Error de base de datos: {e}")
-        return pd.DataFrame()
+def get_chat_preview():
+    # Traemos los últimos 20 mensajes globales para ver actividad
+    response = supabase.table("chat_history").select("*").order("created_at", desc=True).limit(20).execute()
+    return response.data
 
-if st.button('🔄 Actualizar Datos Ahora'):
+def update_order_status(order_id, new_status):
+    supabase.table("orders").update({"status": new_status}).eq("id", order_id).execute()
+    st.toast(f"Orden actualizada a: {new_status}")
+    time.sleep(1)
     st.rerun()
 
-df = get_data()
+# --- INTERFAZ: COMMAND CENTER ---
+st.title("🛸 Komo: Operación Central")
 
-if not df.empty:
-    today = datetime.now().date()
-    # Filtro simple por fecha
-    try:
-        df_today = df[df['created_at'].dt.date == today]
-    except:
-        df_today = df # Si falla la fecha, muestra todo
+# Layout: 65% Mapa (Izquierda), 35% Operación (Derecha)
+col_mapa, col_ops = st.columns([2, 1])
 
-    # KPI'S
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("💰 Ventas Hoy", f"${df_today['total_price'].sum():,.2f}")
-    col2.metric("📦 Pedidos Hoy", len(df_today))
-    gps_count = df_today['delivery_latitude'].notnull().sum()
-    col4.metric("📍 Entregas GPS", f"{gps_count}")
-
-    # MAPA
-    st.subheader(f"🗺️ Mapa en Vivo")
-    map_data = df.dropna(subset=['delivery_latitude', 'delivery_longitude'])
+# --- COLUMNA IZQUIERDA: VISUALIZACIÓN GPS ---
+with col_mapa:
+    st.subheader("📍 Radar de Entregas")
     
-    if not map_data.empty:
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            map_data,
-            get_position='[delivery_longitude, delivery_latitude]',
-            get_color='[200, 30, 0, 160]',
-            get_radius=100,
-            pickable=True,
-        )
-        view_state = pdk.ViewState(
-            latitude=map_data['delivery_latitude'].iloc[0],
-            longitude=map_data['delivery_longitude'].iloc[0],
-            zoom=14
-        )
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state))
+    df_orders = get_live_orders()
+    
+    if not df_orders.empty:
+        # Filtramos las que tienen GPS válido
+        map_data = df_orders.dropna(subset=['delivery_latitude', 'delivery_longitude'])
+        
+        # Convertir a números por si acaso
+        map_data['delivery_latitude'] = pd.to_numeric(map_data['delivery_latitude'])
+        map_data['delivery_longitude'] = pd.to_numeric(map_data['delivery_longitude'])
+
+        if not map_data.empty:
+            # Capa de Puntos (Scatterplot)
+            layer = pdk.Layer(
+                "ScatterplotLayer",
+                map_data,
+                get_position='[delivery_longitude, delivery_latitude]',
+                get_color='[200, 30, 0, 200]',
+                get_radius=200,
+                pickable=True,
+                auto_highlight=True,
+            )
+            
+            # Vista inicial centrada en el primer pedido o fija en Mty
+            view_state = pdk.ViewState(
+                latitude=map_data['delivery_latitude'].iloc[0],
+                longitude=map_data['delivery_longitude'].iloc[0],
+                zoom=13,
+                pitch=45
+            )
+            
+            # Render del mapa
+            r = pdk.Deck(
+                layers=[layer],
+                initial_view_state=view_state,
+                tooltip={"text": "Pedido: {order_number}\nCliente: {customer_phone}\nTotal: ${total_price}"}
+            )
+            st.pydeck_chart(r)
+        else:
+            st.info("Hay pedidos activos, pero sin GPS compartido.")
     else:
-        st.info("Sin datos de GPS aún.")
+        st.write("😴 No hay pedidos activos en el radar.")
+        st.pydeck_chart(pdk.Deck(initial_view_state=pdk.ViewState(latitude=25.68, longitude=-100.31, zoom=12)))
 
-    # TABLA
-    st.markdown("---")
-    st.subheader("👨‍🍳 Comandas")
-    st.dataframe(df[['created_at', 'order_details', 'total_price', 'status', 'delivery_address']], use_container_width=True)
+# --- COLUMNA DERECHA: SALA DE MÁQUINAS ---
+with col_ops:
+    tab_pedidos, tab_chat = st.tabs(["👨‍🍳 Cocina & Despacho", "💬 Live Chat"])
+    
+    # --- PESTAÑA 1: GESTIÓN DE PEDIDOS ---
+    with tab_pedidos:
+        if not df_orders.empty:
+            for index, row in df_orders.iterrows():
+                # Tarjeta de Pedido
+                with st.expander(f"🔥 {row['order_number']} | {row['customer_phone']} | ${row['total_price']}", expanded=True):
+                    st.markdown(f"**Detalle:** {row['order_details']}")
+                    st.markdown(f"**Dirección:** {row['delivery_address']}")
+                    st.caption(f"Status actual: {row['status'].upper()}")
+                    
+                    # Botones de Flujo de Trabajo
+                    c1, c2, c3 = st.columns(3)
+                    if row['status'] == 'confirmed':
+                        if c1.button("👨‍🍳 Cocinar", key=f"cook_{row['id']}"):
+                            update_order_status(row['id'], "cooking")
+                    
+                    if row['status'] == 'cooking':
+                        if c2.button("🛵 Enviar", key=f"ship_{row['id']}"):
+                            update_order_status(row['id'], "delivering")
+                            
+                    if row['status'] == 'delivering':
+                        if c3.button("✅ Finalizar", key=f"done_{row['id']}"):
+                            update_order_status(row['id'], "completed")
+        else:
+            st.success("Todo limpio. Esperando órdenes de WhatsApp... 📲")
 
-else:
-    st.warning("No hay datos para mostrar.")
+    # --- PESTAÑA 2: MONITOR DE CHAT ---
+    with tab_chat:
+        st.caption("Últimos mensajes procesados por GPT-4")
+        chats = get_chat_preview()
+        if chats:
+            for chat in chats:
+                is_bot = chat['role'] == 'assistant'
+                emoji = "🤖" if is_bot else "👤"
+                align = "background-color: #f0f2f6;" if is_bot else "background-color: #dcf8c6;"
+                
+                # Burbuja de chat simple con HTML
+                st.markdown(
+                    f"""
+                    <div style='padding:10px; border-radius:10px; margin-bottom:5px; {align}'>
+                        <strong>{emoji} {chat.get('role', 'user')}:</strong><br>
+                        {chat['content']}
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+        else:
+            st.warning("Historial vacío.")
 
-# SIDEBAR
-with st.sidebar:
-    st.header("⚙️ Admin")
-    st.success("🟢 Sistema Online")
-    st.caption("Conectado vía Plan B (Local)" if ".streamlit" in str(URL) else "Conectado Seguro")
+# --- BOTÓN DE ACTUALIZACIÓN MANUAL ---
+# (Idealmente, usaríamos st_autorefresh, pero esto es seguro y nativo)
+if st.sidebar.button("🔄 REFRESCAR DATOS", type="primary"):
+    st.rerun()
+
+st.sidebar.info(f"Conexión: {URL[:15]}...")
