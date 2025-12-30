@@ -10,7 +10,7 @@ import time
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Komo Command Center", page_icon="🍕", layout="wide")
 
-# --- 🔐 TU SISTEMA DE CONEXIÓN ROBUSTO ---
+# --- 🔐 TU SISTEMA DE CONEXIÓN ---
 def load_credentials():
     try:
         return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
@@ -36,130 +36,165 @@ supabase = init_connection()
 
 # --- FUNCIONES DE DATOS ---
 def get_live_orders():
-    # Traemos órdenes que NO estén completadas o canceladas
+    # Traemos órdenes activas
     response = supabase.table("orders").select("*").in_("status", ["confirmed", "cooking", "delivering"]).order("created_at", desc=True).execute()
-    return pd.DataFrame(response.data)
+    df = pd.DataFrame(response.data)
+    if not df.empty:
+        # Aseguramos que el precio sea numérico para sumar
+        df['total_price'] = pd.to_numeric(df['total_price'], errors='coerce').fillna(0)
+    return df
+
+def get_completed_stats():
+    # Para el resumen histórico (opcional, si quieres ver lo vendido hoy incluye lo cerrado)
+    # Por ahora sumaremos solo lo activo + lo completado hoy si quisieras.
+    # Usaremos el dataframe de live orders para el KPI rápido.
+    pass 
 
 def get_chat_preview():
-    # Traemos los últimos 20 mensajes globales para ver actividad
     response = supabase.table("chat_history").select("*").order("created_at", desc=True).limit(20).execute()
     return response.data
 
 def update_order_status(order_id, new_status):
     supabase.table("orders").update({"status": new_status}).eq("id", order_id).execute()
     st.toast(f"Orden actualizada a: {new_status}")
-    time.sleep(1)
+    time.sleep(0.5)
     st.rerun()
 
-# --- INTERFAZ: COMMAND CENTER ---
+# --- INTERFAZ ---
 st.title("🛸 Komo: Operación Central")
 
-# Layout: 65% Mapa (Izquierda), 35% Operación (Derecha)
-col_mapa, col_ops = st.columns([2, 1])
+# Layout: 60% Mapa, 40% Panel de Control (un poco más espacio para el chat)
+col_mapa, col_ops = st.columns([3, 2])
 
-# --- COLUMNA IZQUIERDA: VISUALIZACIÓN GPS ---
+df_orders = get_live_orders()
+
+# --- COLUMNA IZQUIERDA: MAPA ---
 with col_mapa:
     st.subheader("📍 Radar de Entregas")
     
-    df_orders = get_live_orders()
-    
     if not df_orders.empty:
-        # Filtramos las que tienen GPS válido
+        # KPI RÁPIDO MAPA
+        active_count = len(df_orders)
+        st.caption(f"Monitorizando {active_count} pedidos activos en el mapa.")
+
         map_data = df_orders.dropna(subset=['delivery_latitude', 'delivery_longitude'])
-        
-        # Convertir a números por si acaso
         map_data['delivery_latitude'] = pd.to_numeric(map_data['delivery_latitude'])
         map_data['delivery_longitude'] = pd.to_numeric(map_data['delivery_longitude'])
 
         if not map_data.empty:
-            # Capa de Puntos (Scatterplot)
             layer = pdk.Layer(
                 "ScatterplotLayer",
                 map_data,
                 get_position='[delivery_longitude, delivery_latitude]',
                 get_color='[200, 30, 0, 200]',
-                get_radius=200,
+                get_radius=150,
                 pickable=True,
                 auto_highlight=True,
             )
-            
-            # Vista inicial centrada en el primer pedido o fija en Mty
             view_state = pdk.ViewState(
                 latitude=map_data['delivery_latitude'].iloc[0],
                 longitude=map_data['delivery_longitude'].iloc[0],
                 zoom=13,
                 pitch=45
             )
-            
-            # Render del mapa
             r = pdk.Deck(
                 layers=[layer],
                 initial_view_state=view_state,
-                tooltip={"text": "Pedido: {order_number}\nCliente: {customer_phone}\nTotal: ${total_price}"}
+                tooltip={"text": "Orden: {order_number}\nStatus: {status}"}
             )
             st.pydeck_chart(r)
         else:
-            st.info("Hay pedidos activos, pero sin GPS compartido.")
+            st.info("Pedidos activos sin GPS compartido.")
     else:
-        st.write("😴 No hay pedidos activos en el radar.")
+        st.write("😴 Sin actividad en el radar.")
         st.pydeck_chart(pdk.Deck(initial_view_state=pdk.ViewState(latitude=25.68, longitude=-100.31, zoom=12)))
 
-# --- COLUMNA DERECHA: SALA DE MÁQUINAS ---
+# --- COLUMNA DERECHA: SALA DE CONTROL ---
 with col_ops:
+    # --- SECCIÓN DE RESUMEN (KPIs) ---
+    st.subheader("📊 Métricas en Vivo")
+    
+    if not df_orders.empty:
+        total_ventas = df_orders['total_price'].sum()
+        conteo_status = df_orders['status'].value_counts()
+        
+        # 1. Tarjetas de Totales
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("💰 Por Cobrar", f"${total_ventas:,.0f}")
+        kpi2.metric("📦 Pedidos", len(df_orders))
+        kpi3.metric("🛵 En Ruta", conteo_status.get('delivering', 0))
+        
+        # 2. Resumen de Acciones (Gráfico de Barras simple)
+        st.markdown("**Estado del Flujo:**")
+        st.bar_chart(conteo_status, color="#FF4B4B", height=150)
+        
+    else:
+        st.metric("Esperando Ventas", "$0")
+
+    st.divider()
+
+    # --- PESTAÑAS OPERATIVAS ---
     tab_pedidos, tab_chat = st.tabs(["👨‍🍳 Cocina & Despacho", "💬 Live Chat"])
     
-    # --- PESTAÑA 1: GESTIÓN DE PEDIDOS ---
     with tab_pedidos:
         if not df_orders.empty:
             for index, row in df_orders.iterrows():
-                # Tarjeta de Pedido
-                with st.expander(f"🔥 {row['order_number']} | {row['customer_phone']} | ${row['total_price']}", expanded=True):
-                    st.markdown(f"**Detalle:** {row['order_details']}")
-                    st.markdown(f"**Dirección:** {row['delivery_address']}")
-                    st.caption(f"Status actual: {row['status'].upper()}")
+                # Color del borde según estado
+                emoji_status = "🔥"
+                if row['status'] == 'cooking': emoji_status = "👨‍🍳"
+                if row['status'] == 'delivering': emoji_status = "🛵"
+
+                with st.expander(f"{emoji_status} #{row.get('order_number','?')} | ${row['total_price']}", expanded=True):
+                    st.write(f"**Detalle:** {row['order_details']}")
+                    st.caption(f"📍 {row['delivery_address']}")
                     
-                    # Botones de Flujo de Trabajo
+                    # Botones de Acción
                     c1, c2, c3 = st.columns(3)
-                    if row['status'] == 'confirmed':
-                        if c1.button("👨‍🍳 Cocinar", key=f"cook_{row['id']}"):
-                            update_order_status(row['id'], "cooking")
                     
-                    if row['status'] == 'cooking':
-                        if c2.button("🛵 Enviar", key=f"ship_{row['id']}"):
+                    # Lógica de Botones (Solo muestra el botón siguiente lógico)
+                    if row['status'] == 'confirmed':
+                        if c1.button("Cocinar", key=f"btn_c_{row['id']}"):
+                            update_order_status(row['id'], "cooking")
+                    elif row['status'] == 'cooking':
+                        if c2.button("Enviar", key=f"btn_s_{row['id']}"):
                             update_order_status(row['id'], "delivering")
-                            
-                    if row['status'] == 'delivering':
-                        if c3.button("✅ Finalizar", key=f"done_{row['id']}"):
+                    elif row['status'] == 'delivering':
+                        if c3.button("Entregado", key=f"btn_d_{row['id']}"):
                             update_order_status(row['id'], "completed")
         else:
-            st.success("Todo limpio. Esperando órdenes de WhatsApp... 📲")
+            st.info("Bandeja de entrada limpia. 🧹")
 
-    # --- PESTAÑA 2: MONITOR DE CHAT ---
     with tab_chat:
-        st.caption("Últimos mensajes procesados por GPT-4")
         chats = get_chat_preview()
         if chats:
             for chat in chats:
                 is_bot = chat['role'] == 'assistant'
                 emoji = "🤖" if is_bot else "👤"
-                align = "background-color: #f0f2f6;" if is_bot else "background-color: #dcf8c6;"
                 
-                # Burbuja de chat simple con HTML
+                # --- CORRECCIÓN DE COLORES ---
+                # Usamos colores oscuros con texto blanco explícito
+                bg_color = "#262730" if is_bot else "#1E4620" # Gris oscuro vs Verde oscuro
+                align = "margin-right: 50px;" if not is_bot else "margin-left: 50px;"
+                
                 st.markdown(
                     f"""
-                    <div style='padding:10px; border-radius:10px; margin-bottom:5px; {align}'>
-                        <strong>{emoji} {chat.get('role', 'user')}:</strong><br>
+                    <div style='
+                        background-color: {bg_color};
+                        color: white;
+                        padding: 10px;
+                        border-radius: 10px;
+                        margin-bottom: 8px;
+                        {align}
+                    '>
+                        <small style='opacity: 0.7;'>{emoji} {chat.get('phone_number','User')[-4:]}:</small><br>
                         {chat['content']}
                     </div>
                     """, 
                     unsafe_allow_html=True
                 )
         else:
-            st.warning("Historial vacío.")
+            st.write("Sin historial reciente.")
 
-# --- BOTÓN DE ACTUALIZACIÓN MANUAL ---
-# (Idealmente, usaríamos st_autorefresh, pero esto es seguro y nativo)
-if st.sidebar.button("🔄 REFRESCAR DATOS", type="primary"):
+# Botón de refresco manual
+if st.sidebar.button("🔄 REFRESCAR", type="primary"):
     st.rerun()
-
-st.sidebar.info(f"Conexión: {URL[:15]}...")
