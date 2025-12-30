@@ -8,7 +8,7 @@ from supabase import create_client, Client
 from openai import AsyncOpenAI
 from datetime import datetime
 
-# --- CONFIG ---
+# --- 🔐 CONFIGURACIÓN ---
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "KOMO_TOKEN_2025")
@@ -20,7 +20,8 @@ MANAGER_PHONE = os.environ.get("MANAGER_PHONE")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client: AsyncOpenAI = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# --- UTILIDADES ---
+# --- 🛠️ UTILIDADES WHATSAPP ---
+
 async def send_whatsapp_message(to_number: str, text_body: str):
     if not WHATSAPP_TOKEN: return
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
@@ -43,116 +44,162 @@ async def download_whatsapp_media(media_id: str):
 
 async def transcribe_audio(audio_bytes):
     try:
-        return (await openai_client.audio.transcriptions.create(model="whisper-1", file=("audio.ogg", audio_bytes))).text
+        transcription = await openai_client.audio.transcriptions.create(
+            model="whisper-1", file=("audio.ogg", audio_bytes)
+        )
+        return transcription.text
     except: return ""
 
-# --- LÓGICA DE REPARTIDOR (NUEVO) ---
-async def handle_driver_action(driver_phone, message_type):
-    """Si es chofer y manda evidencia, cierra la orden activa"""
-    try:
-        # Buscar orden activa de este chofer
-        response = supabase.table("orders").select("*").eq("driver_phone", driver_phone).eq("status", "delivering").execute()
-        orders = response.data
-        
-        if orders:
-            order = orders[0]
-            # CERRAR ORDEN
-            supabase.table("orders").update({
-                "status": "completed",
-                "completed_at": datetime.now().isoformat()
-            }).eq("id", order['id']).execute()
-            
-            return f"✅ Orden {order['order_number']} cerrada correctamente. ¡Buen trabajo! 🫡"
-        else:
-            return "No tienes órdenes activas asignadas. 🤔"
-    except Exception as e:
-        print(f"Error Driver: {e}")
-        return "Error cerrando orden."
+# --- 🧠 LÓGICA DE DATOS Y MENÚ ---
 
-# --- LÓGICA DE CLIENTE ---
 def get_menu_text():
     try:
         response = supabase.table("products").select("name, price, description").eq("is_active", True).execute()
         items = response.data
-        menu_str = "MENÚ:\n"
-        for item in items: menu_str += f"- {item['name']}: ${item['price']}\n"
+        if not items: return "Menú en actualización."
+        menu_str = "NUESTRO MENÚ:\n"
+        for item in items:
+            menu_str += f"- {item['name']}: ${item['price']} ({item.get('description','')})\n"
         return menu_str
-    except: return "Consultar menú."
+    except: return "Consultar disponibilidad."
 
 async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
     order_num = f"ORD-{int(time.time())}"
     try:
-        data = {"order_number": order_num, "customer_phone": phone, "order_details": detalle, "total_price": total, "delivery_address": direccion, "status": "confirmed"}
+        data = {
+            "order_number": order_num, "customer_phone": phone, "order_details": detalle,
+            "total_price": total, "delivery_address": direccion, "status": "confirmed"
+        }
         supabase.table("orders").insert(data).execute()
-        if MANAGER_PHONE: await send_whatsapp_message(MANAGER_PHONE, f"💰 VENTA NUEVA: {order_num} (${total})")
-        return f"🎉 Pedido {order_num} Confirmado. ¡Gracias!"
-    except: return "Error técnico."
+        
+        # Alerta al Gerente
+        if MANAGER_PHONE:
+            msg_g = f"💰 ¡VENTA NUEVA!\nOrden: {order_num}\nTotal: ${total}\nItems: {detalle}\nCliente: {phone}"
+            await send_whatsapp_message(MANAGER_PHONE, msg_g)
+            
+        return f"🎉 ¡Pedido {order_num} confirmado!\n\n🍕 {detalle}\n💰 Total: ${total}\n📍 Dirección: {direccion}\n\n¡Ya estamos en la cocina! 🔥"
+    except: return "Perdón, tuve un error al guardar tu pedido. ¿Podemos intentar de nuevo?"
 
-async def ask_gpt4_client(user_message, user_phone, is_audio=False):
-    # Lógica normal de cliente (igual que v7)
+# --- 🏍️ LÓGICA DE REPARTIDOR ---
+
+async def handle_driver_action(driver_phone):
+    """Cierra la orden activa del chofer"""
+    try:
+        resp = supabase.table("orders").select("*").eq("driver_phone", driver_phone).eq("status", "delivering").execute()
+        if resp.data:
+            order = resp.data[0]
+            supabase.table("orders").update({
+                "status": "completed", "completed_at": datetime.now().isoformat()
+            }).eq("id", order['id']).execute()
+            return f"✅ Orden {order['order_number']} cerrada. ¡Excelente servicio! 🫡"
+        return "No tienes órdenes pendientes de entrega. 🤔"
+    except: return "Error al procesar el cierre."
+
+# --- 🤖 EL CEREBRO (GPT-4 CON MEMORIA) ---
+
+async def ask_gpt4_client(user_message: str, user_phone: str, is_audio=False):
     current_menu = get_menu_text()
-    tools = [{"type": "function", "function": {"name": "registrar_pedido", "parameters": {"type": "object", "properties": {"detalle": {"type": "string"}, "total": {"type": "number"}, "direccion": {"type": "string"}, "metodo_pago": {"type": "string"}}, "required": ["detalle", "total", "direccion", "metodo_pago"]}}}]
     
-    messages = [{"role": "system", "content": f"Eres Komo. Vende amable. NPS 100. {current_menu}"}, {"role": "user", "content": user_message}]
-    
-    response = await openai_client.chat.completions.create(model="gpt-4-turbo", messages=messages, tools=tools)
-    msg = response.choices[0].message
-    reply = msg.content
-    if msg.tool_calls:
-        args = json.loads(msg.tool_calls[0].function.arguments)
-        reply = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args.get("metodo_pago", "efectivo"))
-    return reply
+    # 1. Guardar y Obtener Memoria
+    try:
+        note = "[AUDIO] " if is_audio else ""
+        supabase.table("chat_history").insert({"phone_number": user_phone, "role": "user", "content": f"{note}{user_message}"}).execute()
+        
+        hist_resp = supabase.table("chat_history").select("role, content").eq("phone_number", user_phone).order("created_at", desc=True).limit(10).execute()
+        history = [{"role": h["role"], "content": h["content"]} for h in hist_resp.data][::-1]
+    except: history = [{"role": "user", "content": user_message}]
 
-# --- SERVER ---
-app = FastAPI()
+    # 2. Herramientas
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "registrar_pedido",
+            "description": "Solo cuando el cliente confirme items, precio y dirección.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "detalle": {"type": "string"}, "total": {"type": "number"},
+                    "direccion": {"type": "string"}, "metodo_pago": {"type": "string"}
+                },
+                "required": ["detalle", "total", "direccion"]
+            }
+        }
+    }]
+
+    # 3. Prompt NPS 100
+    system_prompt = f"""
+    Eres Komo, el asistente del restaurante. Tu meta es un NPS de 100.
+    Sé extremadamente amable, empático y proactivo.
+    REGLAS:
+    - RECUERDA lo que el cliente pidió antes (mira el historial). 
+    - Si manda ubicación (GPS), úsala como dirección.
+    - {current_menu}
+    """
+
+    messages = [{"role": "system", "content": system_prompt}] + history
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4-turbo", messages=messages, tools=tools, tool_choice="auto"
+        )
+        msg = response.choices[0].message
+        reply = msg.content
+
+        if msg.tool_calls:
+            args = json.loads(msg.tool_calls[0].function.arguments)
+            reply = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args.get("metodo_pago", "efectivo"))
+
+        if reply:
+            supabase.table("chat_history").insert({"phone_number": user_phone, "role": "assistant", "content": reply}).execute()
+        return reply
+    except: return "Lo siento, ¿puedes repetir eso? 🍕"
+
+# --- 🚀 FASTAPI ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 KOMO MASTER BUILD v8.5 LIVE")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/webhook")
 async def verify(request: Request):
-    if request.query_params.get("hub.verify_token") == VERIFY_TOKEN: return int(request.query_params.get("hub.challenge"))
+    if request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
+        return int(request.query_params.get("hub.challenge"))
     raise HTTPException(status_code=403)
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         body = await request.json()
-        entry = body.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
+        messages = body.get("entry", [])[0].get("changes", [])[0].get("value", {}).get("messages", [])
         
         if messages:
             msg = messages[0]
             sender = msg["from"]
             msg_type = msg["type"]
-            
-            # 1. VERIFICAR SI ES CHOFER
-            is_driver = False
-            try:
-                # Checamos si el teléfono está en la tabla 'drivers'
-                driver_check = supabase.table("drivers").select("id").eq("phone_number", sender).execute()
-                if driver_check.data: is_driver = True
-            except: pass
 
-            # 2. SI ES CHOFER, CUALQUIER INPUT CIERRA LA ORDEN
+            # ¿Es Repartidor?
+            dr_check = supabase.table("drivers").select("id").eq("phone_number", sender).execute()
+            is_driver = len(dr_check.data) > 0
+
             if is_driver:
-                reply = await handle_driver_action(sender, msg_type)
+                reply = await handle_driver_action(sender)
                 await send_whatsapp_message(sender, reply)
-            
-            # 3. SI ES CLIENTE, FLUJO NORMAL IA
             else:
-                text_content = ""
-                if msg_type == "text": text_content = msg["text"]["body"]
+                # Flujo Cliente
+                content = ""
+                if msg_type == "text": content = msg["text"]["body"]
                 elif msg_type == "audio":
-                    bytes_ = await download_whatsapp_media(msg["audio"]["id"])
-                    text_content = await transcribe_audio(bytes_)
+                    audio = await download_whatsapp_media(msg["audio"]["id"])
+                    content = await transcribe_audio(audio)
                 elif msg_type == "location":
-                     text_content = f"Ubicación: {msg['location']['latitude']}, {msg['location']['longitude']}"
+                    lat, lon = msg["location"]["latitude"], msg["location"]["longitude"]
+                    content = f"Mi ubicación: http://maps.google.com/?q={lat},{lon}"
 
-                if text_content:
-                    reply = await ask_gpt4_client(text_content, sender)
+                if content:
+                    reply = await ask_gpt4_client(content, sender, is_audio=(msg_type=="audio"))
                     await send_whatsapp_message(sender, reply)
 
         return {"status": "ok"}
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"status": "error"}
+    except: return {"status": "error"}
