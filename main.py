@@ -2,183 +2,224 @@ import os
 import httpx
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from supabase import create_client, Client
 from openai import AsyncOpenAI
-from config import settings, logger
+from datetime import datetime
 
-# --- 🔐 VARIABLES ---
+# --- 🔐 CONFIGURACIÓN Y VARIABLES DE ENTORNO ---
+# Asegúrate de que estas variables estén en tu panel de Render o .env
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "KOMO_TOKEN_2025")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# --- 🏢 CREDENCIALES ---
-BUSINESS_ID = os.environ.get("BUSINESS_ID")
-BRANCH_ID = os.environ.get("BRANCH_ID")
-MANAGER_PHONE = "5218138734122" # Gerente
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+# --- CLIENTES GLOBALES ---
 supabase: Client = None
 openai_client: AsyncOpenAI = None
-CURRENT_MENU_TEXT = "Cargando menú..."
 
-# --- 📡 WHATSAPP ---
+# --- 🛠️ FUNCIONES AUXILIARES: WHATSAPP ---
+
 async def send_whatsapp_message(to_number: str, text_body: str):
+    """Envía mensajes de texto de regreso al usuario"""
     if not WHATSAPP_TOKEN: return
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     data = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": text_body}}
+    
     async with httpx.AsyncClient() as client:
         await client.post(url, headers=headers, json=data)
 
-# --- 🛠️ 1. MEMORIA ---
-async def save_message(phone: str, role: str, content: str):
+async def download_whatsapp_media(media_id: str):
+    """Descarga la imagen de los servidores de Meta"""
     try:
-        supabase.table("chat_history").insert({"phone_number": phone, "role": role, "content": content}).execute()
-    except Exception as e: logger.error(f"Error historial: {e}")
+        async with httpx.AsyncClient() as client:
+            # 1. Obtener la URL de descarga
+            url_info = f"https://graph.facebook.com/v17.0/{media_id}"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+            resp_info = await client.get(url_info, headers=headers)
+            media_url = resp_info.json().get("url")
+            
+            if not media_url: return None
 
-async def get_chat_history(phone: str, limit: int = 6):
+            # 2. Descargar el binario (la imagen real)
+            resp_media = await client.get(media_url, headers=headers)
+            return resp_media.content # Retorna bytes
+    except Exception as e:
+        print(f"Error descargando media: {e}")
+        return None
+
+# --- 🛠️ FUNCIONES AUXILIARES: SUPABASE ---
+
+async def upload_evidence_to_supabase(image_bytes, phone):
+    """Sube la imagen al bucket 'evidencias' y retorna la URL pública"""
+    filename = f"{phone}_{int(time.time())}.jpg"
     try:
-        response = supabase.table("chat_history").select("role, content").eq("phone_number", phone).order("created_at", desc=True).limit(limit).execute()
-        return response.data[::-1]
-    except Exception: return []
+        # Subir al bucket 'evidencias'
+        supabase.storage.from_("evidencias").upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+        # Obtener URL pública
+        public_url = supabase.storage.from_("evidencias").get_public_url(filename)
+        return public_url
+    except Exception as e:
+        print(f"Error subiendo a Supabase: {e}")
+        return None
 
-# --- 🛠️ 2. MENÚ ---
-async def get_menu_from_db():
+async def create_complaint_ticket(phone, image_url, caption):
+    """Crea un ticket en la tabla complaints"""
     try:
-        response = supabase.table("products").select("*").eq("is_active", True).execute()
-        products = response.data
-        if not products: return "Sin productos."
-        menu_text = "MENÚ:\n"
-        for p in products: menu_text += f"- {p['name']}: ${p['price']}\n"
-        return menu_text
-    except Exception: return "Error menú."
+        data = {
+            "customer_phone": phone,
+            "issue_description": caption or "Imagen enviada por cliente (Posible evidencia)",
+            "image_url": image_url,
+            "status": "open"
+        }
+        supabase.table("complaints").insert(data).execute()
+        return True
+    except Exception as e:
+        print(f"Error creando ticket: {e}")
+        return False
 
-# --- 🛠️ 3. REGISTRO (AHORA CON GPS) ---
+# --- 🧠 LÓGICA DE NEGOCIO (GPT Y PEDIDOS) ---
+
 async def registrar_pedido_db(phone: str, detalle: str, total: float, direccion: str, metodo_pago: str, lat: float = None, long: float = None):
+    """Guarda la orden en la tabla 'orders'"""
     order_num = f"ORD-{int(time.time())}"
     try:
-        # Datos a insertar
         data = {
-            "business_id": BUSINESS_ID, "branch_id": BRANCH_ID,
-            "customer_phone": phone, "order_details": detalle,
-            "total_price": total, "status": "confirmed",
-            "order_number": order_num, "order_type": "delivery",
-            "delivery_address": direccion, 
-            "payment_method": metodo_pago,
-            "delivery_latitude": lat,   # 📍 Coordenada GPS
-            "delivery_longitude": long  # 📍 Coordenada GPS
+            "order_number": order_num,
+            "customer_phone": phone,
+            "order_details": detalle,
+            "total_price": total,
+            "delivery_address": direccion,
+            "payment_status": "pending", # Asumimos pendiente hasta confirmar
+            "status": "confirmed",       # Entra directo como confirmado para cocina
+            "delivery_latitude": lat,
+            "delivery_longitude": long,
+            "customer_name": "Cliente WhatsApp" # Podríamos pedir el nombre luego
         }
-        
         supabase.table("orders").insert(data).execute()
         
-        # 🔔 Notificación Gerente (Con link a Google Maps si hay GPS)
-        maps_link = ""
-        if lat and long:
-            maps_link = f"\n🗺️ Ver en Mapa: https://www.google.com/maps/search/?api=1&query={lat},{long}"
-
-        mensaje_gerente = f"""🔔 *NUEVO PEDIDO GPS* 🛰️
-🆔 {order_num}
-👤 {phone}
-🍕 {detalle}
-💰 ${total} ({metodo_pago})
-📍 {direccion}{maps_link}"""
-
-        await send_whatsapp_message(MANAGER_PHONE, mensaje_gerente)
-        return f"Pedido {order_num} registrado. Enviaremos a: {direccion}."
+        # Notificar éxito
+        msg = f"✅ ¡Listo! Tu pedido {order_num} está confirmado.\nTotal: ${total}\nEnviaremos a: {direccion}"
+        return msg
     except Exception as e:
-        logger.error(f"Error DB: {e}")
-        return "Error interno."
+        print(f"Error DB: {e}")
+        return "Tuve un error registrando el pedido. Por favor intenta de nuevo."
 
-# --- 🧠 CEREBRO ---
-async def ask_gpt4(user_message: str, user_phone: str):
-    global CURRENT_MENU_TEXT
+async def ask_gpt4(user_message: str, user_phone: str, is_location_pin=False):
+    """El cerebro que decide qué hacer"""
     
-    # Guardamos mensaje entrante (Si es ubicación, ya viene convertido a texto)
-    await save_message(user_phone, "user", user_message)
-    history = await get_chat_history(user_phone)
+    # Historial de chat
+    history_resp = supabase.table("chat_history").select("role, content").eq("phone_number", user_phone).order("created_at", desc=True).limit(6).execute()
+    history = history_resp.data[::-1] if history_resp.data else []
     
+    # Definición de Herramientas (Function Calling)
     tools = [{
         "type": "function",
         "function": {
             "name": "registrar_pedido",
-            "description": "Usa esto con PRODUCTO, DIRECCIÓN y PAGO. Si envió ubicación GPS, úsala.",
+            "description": "Registra un pedido cuando el usuario confirma productos, dirección y total.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "detalle": {"type": "string"}, "total": {"type": "number"},
-                    "direccion": {"type": "string", "description": "Dirección escrita o 'Ubicación GPS'"},
-                    "metodo_pago": {"type": "string"},
-                    "lat": {"type": "number", "description": "Latitud si está disponible"},
-                    "long": {"type": "number", "description": "Longitud si está disponible"}
+                    "detalle": {"type": "string", "description": "Lista de productos"},
+                    "total": {"type": "number", "description": "Costo total estimado"},
+                    "direccion": {"type": "string", "description": "Dirección de entrega"},
+                    "metodo_pago": {"type": "string", "enum": ["efectivo", "tarjeta"]},
+                    "lat": {"type": "number"},
+                    "long": {"type": "number"}
                 },
                 "required": ["detalle", "total", "direccion", "metodo_pago"]
             }
         }
     }]
 
-    system_prompt = f"""
-    Eres Komo, vendedor de pizzas. MENÚ: {CURRENT_MENU_TEXT}
-    REGLAS:
-    1. Si el historial dice "UBICACIÓN_GPS_RECIBIDA", ¡ya tienes la dirección! No la pidas de nuevo.
-       Usa las coordenadas (Lat/Long) que veas en el mensaje del sistema.
-    2. Si tienes coordenadas, en el campo 'direccion' pon "Ubicación GPS compartida".
-    3. Pide amablemente lo que falte.
+    # Prompt del Sistema
+    system_prompt = """
+    Eres Komo, un asistente de delivery eficiente y amable.
+    Tu menú básico: Pizzas $150, Tacos $80, Refrescos $20.
+    
+    1. Si recibes coordenadas (Lat/Long), asume que es la dirección de entrega.
+    2. Antes de pedir, confirma el total.
+    3. Si el usuario envía una foto, diles que un humano revisará su caso.
     """
     
     messages = [{"role": "system", "content": system_prompt}] + history
+    
+    # Si es un pin de ubicación, lo inyectamos como mensaje de sistema para que GPT lo sepa usar
+    if is_location_pin:
+        messages.append({"role": "system", "content": f"SISTEMA: El usuario envió su ubicación GPS actual: {user_message}"})
+    else:
+        messages.append({"role": "user", "content": user_message})
 
+    # Llamada a OpenAI
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4-turbo", messages=messages, tools=tools, tool_choice="auto", temperature=0.7
+            model="gpt-4-turbo", messages=messages, tools=tools, tool_choice="auto"
         )
         msg = response.choices[0].message
-        bot_reply = msg.content
-
+        
+        # Si GPT quiere ejecutar la función (Registrar Pedido)
         if msg.tool_calls:
             tool_call = msg.tool_calls[0]
             args = json.loads(tool_call.function.arguments)
-            # Extraemos lat/long si GPT los encontró en el historial
-            lat = args.get("lat")
-            long = args.get("long")
             
-            resultado = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args["metodo_pago"], lat, long)
+            # Ejecutamos la función
+            reply_text = await registrar_pedido_db(
+                user_phone, args["detalle"], args["total"], args["direccion"], 
+                args.get("metodo_pago", "efectivo"), args.get("lat"), args.get("long")
+            )
             
-            messages.append(msg)
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": resultado})
-            final = await openai_client.chat.completions.create(model="gpt-4-turbo", messages=messages)
-            bot_reply = final.choices[0].message.content
+            # Guardamos la respuesta final
+            await supabase.table("chat_history").insert({"phone_number": user_phone, "role": "assistant", "content": reply_text}).execute()
+            return reply_text
         
-        await save_message(user_phone, "assistant", bot_reply)
+        # Si es solo charla normal
+        bot_reply = msg.content
+        await supabase.table("chat_history").insert({"phone_number": user_phone, "role": "user", "content": user_message}).execute()
+        await supabase.table("chat_history").insert({"phone_number": user_phone, "role": "assistant", "content": bot_reply}).execute()
         return bot_reply
 
     except Exception as e:
-        logger.error(f"Error GPT: {e}")
-        return "Un momento..."
+        print(f"Error GPT: {e}")
+        return "Un momento, estoy procesando..."
 
-# --- 🚀 WEBHOOK HANDLER INTELIGENTE ---
+# --- 🚀 CONFIGURACIÓN DEL SERVIDOR (LIFESPAN) ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supabase, openai_client, CURRENT_MENU_TEXT
-    supabase = create_client(settings.supabase_url, settings.supabase_key)
+    global supabase, openai_client
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    CURRENT_MENU_TEXT = await get_menu_from_db()
-    logger.info("🚀 KOMO GPS ACTIVO")
+    print("🚀 KOMO BACKEND V4.0 ONLINE")
     yield
 
-app = FastAPI(title="Komo GPS", lifespan=lifespan)
+app = FastAPI(title="Komo Backend", lifespan=lifespan)
+
+# --- RUTAS ---
 
 @app.get("/")
-def home(): return {"status": "GPS Ready 🛰️"}
+def home(): return {"status": "Online", "version": "4.0 Anti-Rappi"}
 
 @app.get("/webhook")
-async def verify(request: Request):
-    if request.query_params.get("hub.verify_token") == VERIFY_TOKEN: return int(request.query_params.get("hub.challenge"))
-    raise HTTPException(status_code=403)
+async def verify_webhook(request: Request):
+    """Verificación de Meta para conectar el Webhook"""
+    if request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
+        return int(request.query_params.get("hub.challenge"))
+    raise HTTPException(status_code=403, detail="Token inválido")
 
 @app.post("/webhook")
 async def webhook_handler(request: Request):
+    """Recibe TODOS los mensajes de WhatsApp"""
     try:
         body = await request.json()
         entry = body.get("entry", [])[0]
@@ -189,26 +230,40 @@ async def webhook_handler(request: Request):
         if messages:
             msg = messages[0]
             sender = msg["from"]
+            msg_type = msg["type"]
             
-            # --- DETECCIÓN DE TIPO DE MENSAJE ---
-            if msg["type"] == "text":
-                user_text = msg["text"]["body"]
-                await send_whatsapp_message(sender, await ask_gpt4(user_text, sender))
-                
-            elif msg["type"] == "location":
-                # 📍 EL USUARIO ENVIÓ SU UBICACIÓN
+            # CASO 1: TEXTO NORMAL
+            if msg_type == "text":
+                text = msg["text"]["body"]
+                reply = await ask_gpt4(text, sender)
+                await send_whatsapp_message(sender, reply)
+            
+            # CASO 2: UBICACIÓN (GPS)
+            elif msg_type == "location":
                 loc = msg["location"]
-                lat = loc["latitude"]
-                lng = loc["longitude"]
+                coords_text = f"Lat: {loc['latitude']}, Long: {loc['longitude']}"
+                # Pasamos flag True para indicar que es un Pin
+                reply = await ask_gpt4(coords_text, sender, is_location_pin=True)
+                await send_whatsapp_message(sender, reply)
+            
+            # CASO 3: IMAGEN (NUEVO - EVIDENCIA/QUEJA)
+            elif msg_type == "image":
+                image_id = msg["image"]["id"]
+                caption = msg["image"].get("caption", "")
                 
-                # Truco: Convertimos la ubicación en un mensaje de texto "simulado" para que GPT lo entienda
-                # Agregamos instrucciones ocultas para GPT
-                system_injection = f"UBICACIÓN_GPS_RECIBIDA: Lat {lat}, Long {lng}. (El usuario compartió su ubicación actual)."
-                
-                # Procesamos esto como si el usuario lo hubiera escrito
-                await send_whatsapp_message(sender, await ask_gpt4(system_injection, sender))
-                
+                # Descargar y subir
+                image_bytes = await download_whatsapp_media(image_id)
+                if image_bytes:
+                    public_url = await upload_evidence_to_supabase(image_bytes, sender)
+                    if public_url:
+                        # Crear Ticket
+                        await create_complaint_ticket(sender, public_url, caption)
+                        await send_whatsapp_message(sender, "📷 Imagen recibida. Hemos abierto un ticket de soporte y el gerente revisará la evidencia.")
+                    else:
+                        await send_whatsapp_message(sender, "Error procesando la imagen.")
+            
         return {"status": "ok"}
+        
     except Exception as e:
-        logger.error(f"Error Webhook: {e}")
+        print(f"Error procesando webhook: {e}")
         return {"status": "error"}
