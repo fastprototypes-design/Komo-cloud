@@ -48,8 +48,6 @@ async def download_whatsapp_media(media_id: str):
     except Exception as e:
         print(f"Error downloading media: {e}")
         return None
-        print(f"Error downloading media: {e}")
-        return None
 
 async def transcribe_audio(audio_bytes):
     try:
@@ -83,7 +81,6 @@ async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
         }
         supabase.table("orders").insert(data).execute()
         
-        # Alerta al Gerente
         if MANAGER_PHONE:
             msg_g = f"💰 ¡VENTA NUEVA!\nOrden: {order_num}\nTotal: ${total}\nItems: {detalle}\nCliente: {phone}"
             await send_whatsapp_message(MANAGER_PHONE, msg_g)
@@ -92,96 +89,99 @@ async def registrar_pedido_db(phone, detalle, total, direccion, metodo_pago):
     except Exception as e:
         print(f"Error registering order: {e}")
         return "Perdón, tuve un error al guardar tu pedido. ¿Podemos intentar de nuevo?"
-        print(f"Error registering order: {e}")
-        return "Perdón, tuve un error al guardar tu pedido. ¿Podemos intentar de nuevo?"
 
-# --- 🏍️ LÓGICA DE REPARTIDOR ---
+# --- 🏍️ LÓGICA DE REPARTIDOR, EVIDENCIA Y NPS ---
 
-async def handle_driver_action(driver_phone):
+async def handle_driver_media(driver_phone, media_id):
     try:
-        resp = supabase.table("orders").select("*").eq("driver_phone", driver_phone).eq("status", "delivering").execute()
-        if resp.data:
-            order = resp.data[0]
+        resp = supabase.table("orders").select("id, order_number, customer_phone").eq("driver_phone", driver_phone).eq("status", "delivering").execute()
+        if not resp.data:
+            return "No tienes órdenes pendientes para subir evidencia. 🤔"
+        
+        order = resp.data[0]
+        photo_bytes = await download_whatsapp_media(media_id)
+        
+        if photo_bytes:
+            file_path = f"evidencias/evidencia_{order['order_number']}.jpg"
+            # Subir a Supabase Storage
+            supabase.storage.from_("evidencias").upload(file_path, photo_bytes, {"content-type": "image/jpeg"})
+            photo_url = supabase.storage.from_("evidencias").get_public_url(file_path)
+            
+            # Finalizar orden y guardar URL
             supabase.table("orders").update({
-                "status": "completed", "completed_at": datetime.now().isoformat()
+                "status": "completed", 
+                "completed_at": datetime.now().isoformat(),
+                "delivery_photo_url": photo_url
             }).eq("id", order['id']).execute()
-            return f"✅ Orden {order['order_number']} cerrada. ¡Excelente servicio! 🫡"
-        return "No tienes órdenes pendientes de entrega. 🤔"
+            
+            # Enviar encuesta NPS al cliente
+            await send_nps_survey(order['customer_phone'], order['order_number'])
+            
+            return f"✅ Evidencia guardada y Orden {order['order_number']} finalizada. ¡Buen servicio! 🫡"
+        return "Error al descargar la foto."
     except Exception as e:
-        print(f"Error handling driver action: {e}")
-        return "Error al procesar el cierre."
+        print(f"Error handling media: {e}")
+        return "Error al procesar la evidencia."
 
-# --- 🤖 EL CEREBRO (GPT-4 CON MEMORIA DE 5 PASOS) ---
+async def send_nps_survey(customer_phone, order_num):
+    msg = (f"¡Tu pedido {order_num} ha llegado! 🍕\n\n"
+           "Ayúdanos a mejorar. ¿Qué tan satisfecho estás? "
+           "Responde solo con un número del 1 al 5:\n"
+           "5 - Excelente ⭐\n1 - Malo 😡")
+    await send_whatsapp_message(customer_phone, msg)
+
+async def save_nps_rating(customer_phone, rating_text):
+    if rating_text.isdigit() and int(rating_text) in [1,2,3,4,5]:
+        order = supabase.table("orders").select("id").eq("customer_phone", customer_phone).eq("status", "completed").order("completed_at", desc=True).limit(1).execute()
+        if order.data:
+            supabase.table("orders").update({"rating": int(rating_text)}).eq("id", order.data[0]['id']).execute()
+            return "¡Muchas gracias por tu calificación! 😊"
+    return None
+
+# --- 🤖 EL CEREBRO GPT-4 ---
 
 async def ask_gpt4_client(user_message: str, user_phone: str, is_audio=False):
     current_menu = get_menu_text()
     
-    # 1. Guardar y Obtener Memoria Limitada (Últimas 5-8 interacciones)
     try:
         note = "[AUDIO] " if is_audio else ""
         supabase.table("chat_history").insert({"phone_number": user_phone, "role": "user", "content": f"{note}{user_message}"}).execute()
-        
-        # Leemos los últimos 8 registros para un contexto fluido pero ligero
         hist_resp = supabase.table("chat_history").select("role, content").eq("phone_number", user_phone).order("created_at", desc=True).limit(8).execute()
         history = [{"role": h["role"], "content": h["content"]} for h in hist_resp.data][::-1]
     except Exception as e:
-        print(f"Error retrieving chat history: {e}")
+        print(f"History error: {e}")
         history = [{"role": "user", "content": user_message}]
 
-    # 2. Herramientas
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "registrar_pedido",
-            "description": "Solo cuando el cliente confirme items, precio y dirección de entrega.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "detalle": {"type": "string"}, "total": {"type": "number"},
-                    "direccion": {"type": "string"}, "metodo_pago": {"type": "string"}
-                },
-                "required": ["detalle", "total", "direccion"]
-            }
-        }
-    }]
+    tools = [{"type": "function", "function": {"name": "registrar_pedido", "description": "Cuando el cliente confirme items, precio y dirección.", "parameters": {"type": "object", "properties": {"detalle": {"type": "string"}, "total": {"type": "number"}, "direccion": {"type": "string"}}, "required": ["detalle", "total", "direccion"]}}}]
 
-    # 3. Prompt Personalizado NPS 100
     system_prompt = f"""
     Eres Komo, el asistente virtual de Komo Fast Food. Tu meta es un NPS de 100.
-    
-    - SALUDO INTELIGENTE: Di "Gracias por comunicarte a Komo Fast Food" SOLO si es el primer mensaje del cliente o si han pasado más de 3 horas desde el último mensaje. En la conversación fluida, no repitas el saludo, pregunta a nombre de quien sera la orden enviada.
-    - PERSONALIDAD: Sé extremadamente amable, empático y proactivo.
-    - MEMORIA ACTIVA: REVISA EL HISTORIAL RECIENTE para no pedir datos que el cliente ya dio. Si el cliente añade productos (ej: "también una coca"), súmalo a lo anterior.
-    - UBICACIÓN: Si manda un link de ubicación o coordenadas, úsalo como la dirección de entrega.
-    - RESPETO AL GERENTE: Si en el historial ves un mensaje que dice "GERENTE DICE:", el gerente ha tomado el control. No contradigas lo que el humano dijo y confírmalo amablemente.
-    
+    - SALUDO: Di "Gracias por comunicarte a Komo Fast Food" SOLO si es el inicio de la charla.
+    - MEMORIA: No pidas datos que ya estén en el historial.
+    - UBICACIÓN: Si mandan coordenadas, úsalas para la entrega.
+    - GERENTE: Si ves "GERENTE DICE:", el humano tiene el mando, respétalo.
     {current_menu}
     """
 
-    messages = [{"role": "system", "content": system_prompt}] + history
-
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4-turbo", messages=messages, tools=tools, tool_choice="auto"
-        )
+        response = await openai_client.chat.completions.create(model="gpt-4-turbo", messages=[{"role": "system", "content": system_prompt}] + history, tools=tools, tool_choice="auto")
         msg = response.choices[0].message
         reply = msg.content
 
         if msg.tool_calls:
             args = json.loads(msg.tool_calls[0].function.arguments)
-            reply = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], args.get("metodo_pago", "efectivo"))
+            reply = await registrar_pedido_db(user_phone, args["detalle"], args["total"], args["direccion"], "efectivo")
 
         if reply:
             supabase.table("chat_history").insert({"phone_number": user_phone, "role": "assistant", "content": reply}).execute()
         return reply
-    except Exception as e:
-        print(f"Error calling GPT-4: {e}")
-        return "Gracias por comunicarte a Komo Fast Food. Tuve un pequeño error, ¿puedes repetirme lo último? 🍕"
+    except:
+        return "Gracias por comunicarte a Komo Fast Food. ¿Podrías repetirme eso? 🍕"
 
 # --- 🚀 FASTAPI ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 KOMO MASTER BUILD v8.6 LIVE - KOMO FAST FOOD")
+    print("🚀 KOMO MASTER BUILD v9.1 LIVE - EVIDENCIA & NPS")
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -189,57 +189,58 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/webhook")
 async def verify(request: Request):
     if request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(request.query_params.get("hub.challenge"))
+        challenge = request.query_params.get("hub.challenge")
+        return int(challenge) if challenge else 0
     raise HTTPException(status_code=403)
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         body = await request.json()
-        entry = body.get("entry", [])
-        if not entry:
-            return {"status": "ok"}
-        
-        messages = entry[0].get("changes", [])[0].get("value", {}).get("messages", [])
+        entry = body.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
         
         if messages:
             msg = messages[0]
             sender = msg.get("from")
             msg_type = msg.get("type")
             
-            if not sender or not msg_type:
-                return {"status": "ok"}
-
-            # ¿Es Repartidor?
+            # Check Driver
             dr_check = supabase.table("drivers").select("id").eq("phone_number", sender).execute()
             is_driver = len(dr_check.data) > 0
 
-            if is_driver:
-                reply = await handle_driver_action(sender)
+            # 1. Repartidor manda imagen (Evidencia)
+            if is_driver and msg_type == "image":
+                reply = await handle_driver_media(sender, msg["image"]["id"])
                 await send_whatsapp_message(sender, reply)
-            else:
-                # Flujo Cliente
-                content = ""
-                if msg_type == "text":
-                    content = msg.get("text", {}).get("body", "")
-                elif msg_type == "audio":
-                    audio_id = msg.get("audio", {}).get("id")
-                    if audio_id:
-                        audio = await download_whatsapp_media(audio_id)
-                        if audio:
-                            content = await transcribe_audio(audio)
-                elif msg_type == "location":
-                    loc = msg.get("location", {})
-                    lat = loc.get("latitude")
-                    lon = loc.get("longitude")
-                    if lat is not None and lon is not None:
-                        content = f"Mi ubicación: https://www.google.com/maps?q={lat},{lon}"
 
+            # 2. Cliente manda texto (NPS o Chat)
+            elif msg_type == "text":
+                content = msg["text"]["body"]
+                nps_reply = await save_nps_rating(sender, content)
+                if nps_reply:
+                    await send_whatsapp_message(sender, nps_reply)
+                else:
+                    reply = await ask_gpt4_client(content, sender)
+                    await send_whatsapp_message(sender, reply)
+            
+            # 3. Audio o Ubicación
+            elif msg_type in ["audio", "location"]:
+                content = ""
+                if msg_type == "audio":
+                    audio = await download_whatsapp_media(msg["audio"]["id"])
+                    if audio: content = await transcribe_audio(audio)
+                else:
+                    loc = msg["location"]
+                    content = f"Mi ubicación: https://www.google.com/maps?q={loc['latitude']},{loc['longitude']}"
+                
                 if content:
                     reply = await ask_gpt4_client(content, sender, is_audio=(msg_type=="audio"))
                     await send_whatsapp_message(sender, reply)
 
         return {"status": "ok"}
     except Exception as e:
-        print(f"Error processing webhook: {e}")
+        print(f"Webhook error: {e}")
         return {"status": "error"}
